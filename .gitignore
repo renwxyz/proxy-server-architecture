@@ -1,0 +1,23 @@
+# Proxy cache — generated at runtime, not part of source
+cache/*
+!cache/.gitkeep
+
+# Python bytecode and interpreter artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# macOS and Windows filesystem metadata
+.DS_Store
+Thumbs.db
+
+# Editor and IDE configuration (local to each contributor)
+.vscode/
+.idea/
+*.swp
+
+# Application log output
+*.log
+
+# Local planning notes
+docs/plan/
