@@ -37,7 +37,6 @@ def close_socket(sock):
 
 
 def log_request(addr, method, path, http_version, cache_status, elapsed_ms, status_code):
-    """Catat metadata request ke terminal."""
     client_ip    = addr[0] if addr else "-"
     request_line = f"{method} {path} {http_version}"
     cache_label  = "HIT " if cache_status == "HIT" else "MISS"
