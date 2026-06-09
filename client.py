@@ -1,6 +1,7 @@
 import socket
 import sys
 import time
+import statistics
 
 PROXY_HOST      = "127.0.0.1"  # ganti dengan IP laptop proxy saat demo
 PROXY_PORT      = 8080
@@ -130,16 +131,16 @@ def print_stats(sent, rtt_list):
     avg_rtt = sum(rtt_list) / received
     max_rtt = max(rtt_list)
 
-    # Jitter = rata-rata selisih absolut antar RTT berurutan (RFC 3550)
+    # Jitter = σ(RTT_i - RTT_{i-1}) sesuai ketentuan soal
     if received > 1:
-        jitter = sum(
-            abs(rtt_list[i+1] - rtt_list[i]) for i in range(received - 1)
-        ) / (received - 1)
+        diffs = [rtt_list[i+1] - rtt_list[i] for i in range(received - 1)]
+        jitter = statistics.stdev(diffs)
     else:
         jitter = 0.0
 
     print(f"RTT    : min={min_rtt:.2f}ms  avg={avg_rtt:.2f}ms  max={max_rtt:.2f}ms")
     print(f"Jitter : {jitter:.2f}ms")
+    print(f"Loss   : {loss_pct:.1f}%")
 
 if __name__ == "__main__":
     main()

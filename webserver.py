@@ -56,9 +56,9 @@ def tcp_accept_loop(tcp_sock):
             conn, addr = tcp_sock.accept()
         except socket.timeout:
             continue
-        log_connection(addr)
         worker = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
         worker.start()
+        log_connection(addr, worker) 
 
 def handle_client(conn, addr):
     method = path = "-"
@@ -196,8 +196,9 @@ def udp_echo_loop(udp_sock):
             print(f"[UDP] {client_addr[0]}:{client_addr[1]} — echoed {len(data)} bytes")
         except OSError:
             break
-def log_connection(addr):
-    print(f"[{now()}] [TCP] Connection from {addr[0]}:{addr[1]}")
+
+def log_connection(addr, thread: threading.Thread):
+    print(f"[{now()}] [TCP] Connection from {addr[0]}:{addr[1]} → Thread-{thread.ident}")
 
 
 def log_request(addr, method, path, status):
