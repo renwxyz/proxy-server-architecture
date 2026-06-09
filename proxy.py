@@ -3,21 +3,26 @@ import socket
 import threading
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 
 
 PROXY_HOST       = "0.0.0.0"
 PROXY_PORT       = 8080
+
 SERVER_HOST      = "192.168.1.10"   # IP Laptop web server
 SERVER_PORT      = 8000
+
 BUFFER_SIZE      = 4096
 MAX_REQUEST_SIZE = 8192
-REQUEST_TIMEOUT  = 10               
+REQUEST_TIMEOUT  = 10   
+
 BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR        = os.path.join(BASE_DIR, "cache")
 
 STATUS_MESSAGES = {
     200: "OK",
     400: "Bad Request",
+    405: "Method Not Allowed",
     502: "Bad Gateway",
     504: "Gateway Timeout",
 }
@@ -75,6 +80,13 @@ def parse_http_request(raw_data):
             return None
 
         method, path, http_version = parts[0], parts[1], parts[2]
+
+        # FIX 1: Parse absolute URL dari browser
+        # Browser yg dikonfigurasi pakai proxy mengirim full URL, contoh:
+        # GET http://192.168.1.10:8000/index.html HTTP/1.1
+        # Kita ekstrak path-nya saja agar forwarding tetap benar
+        if path.startswith("http"):
+            path = urlparse(path).path or "/"
 
         headers = {}
         for line in lines[1:]:
@@ -179,12 +191,16 @@ def forward_to_server(request_path, original_headers):
         sock.connect((SERVER_HOST, SERVER_PORT))
 
         request_line = f"GET {request_path} HTTP/1.1\r\n"
-        headers = (
-            f"Host: {SERVER_HOST}:{SERVER_PORT}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        )
-        sock.sendall((request_line + headers).encode("ascii"))
+
+        # FIX 2: Forward header relevan dari browser ke server
+        # Sebelumnya hanya Host & Connection yg dikirim, browser butuh
+        # header seperti User-Agent & Accept agar server merespons dengan benar
+        forward_headers = f"Host: {SERVER_HOST}:{SERVER_PORT}\r\nConnection: close\r\n"
+        for key in ["user-agent", "accept", "accept-language"]:
+            if key in original_headers:
+                forward_headers += f"{key}: {original_headers[key]}\r\n"
+
+        sock.sendall((request_line + forward_headers + "\r\n").encode("ascii", errors="replace"))
 
         response = b""
         while True:
@@ -225,6 +241,16 @@ def handle_client(conn, addr, cache_lock):
         path         = parsed["path"]
         http_version = parsed["http_version"]
         headers      = parsed["headers"]
+
+        # FIX 3: Tolak CONNECT (HTTPS) dengan jelas — 405 Method Not Allowed
+        # Proxy ini hanya mendukung HTTP, bukan HTTPS tunneling
+        if method == "CONNECT":
+            status_code = 405
+            response    = build_error_response(405)
+            send_response(conn, response)
+            elapsed_ms = (time.time() - start_time) * 1000
+            log_request(addr, method, path, http_version, cache_status, elapsed_ms, status_code)
+            return
 
         cache_path = get_cache_path(path)
 
