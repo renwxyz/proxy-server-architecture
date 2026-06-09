@@ -5,202 +5,200 @@ import time
 from datetime import datetime
 from urllib.parse import urlparse
 
+PROXY_HOST  = "0.0.0.0"
+PROXY_PORT  = 8080
 
-PROXY_HOST       = "0.0.0.0"
-PROXY_PORT       = 8080
+SERVER_HOST = "127.0.0.1"   # ganti dengan IP laptop web server saat demo
+SERVER_PORT = 8000
 
-SERVER_HOST      = "192.168.1.10"   # IP Laptop web server
-SERVER_PORT      = 8000
+BUFFER_SIZE = 4096
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR   = os.path.join(BASE_DIR, "cache")
 
-BUFFER_SIZE      = 4096
-MAX_REQUEST_SIZE = 8192
-REQUEST_TIMEOUT  = 10   
+# Lock ini melindungi operasi tulis cache dari race condition
+# saat banyak thread melayani request secara bersamaan
+CACHE_LOCK  = threading.Lock()
 
-BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR        = os.path.join(BASE_DIR, "cache")
+def main():
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
-STATUS_MESSAGES = {
-    200: "OK",
-    400: "Bad Request",
-    405: "Method Not Allowed",
-    502: "Bad Gateway",
-    504: "Gateway Timeout",
-}
+    proxy_sock = start_proxy_server()
 
-
-def current_timestamp():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def close_socket(sock):
-    if sock is None:
-        return
     try:
-        sock.close()
-    except OSError:
-        pass
+        proxy_accept_loop(proxy_sock)
+    except KeyboardInterrupt:
+        print("\n[PROXY] Shutting down...")
+    finally:
+        proxy_sock.close()
 
 
-def log_request(addr, method, path, http_version, cache_status, elapsed_ms, status_code):
-    client_ip    = addr[0] if addr else "-"
-    request_line = f"{method} {path} {http_version}"
-    cache_label  = "HIT " if cache_status == "HIT" else "MISS"
-    print(
-        f"[{current_timestamp()}] [{cache_label}] [{status_code}] {client_ip} "
-        f'"{request_line}" {elapsed_ms:.1f}ms '
-        f"thread={threading.current_thread().name}"
-    )
+def start_proxy_server():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((PROXY_HOST, PROXY_PORT))
+    sock.listen()
+    sock.settimeout(1.0)
+    print(f"[PROXY] Listening on {PROXY_HOST}:{PROXY_PORT}")
+    print(f"[PROXY] Forwarding to {SERVER_HOST}:{SERVER_PORT}")
+    return sock
 
 
-def read_http_request(conn):
-    raw_data = b""
+def proxy_accept_loop(proxy_sock):
+    while True:
+        try:
+            conn, addr = proxy_sock.accept()
+        except socket.timeout:
+            continue
+        print(f"[{now()}] [PROXY] Connection from {addr[0]}:{addr[1]}")
+        worker = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+        worker.start()
+
+def handle_client(conn, addr):
+    method = path = "-"
+    status = 400
+    cache_status = "MISS"
+    start = time.time()
+
+    try:
+        raw = read_request(conn)
+        parsed = parse_request(raw)
+
+        if parsed is None:
+            conn.sendall(build_error_response(400)[0])
+            return
+
+        method = parsed["method"]
+        path   = parsed["path"]
+
+        # Proxy ini hanya mendukung HTTP — tolak HTTPS tunneling
+        if method == "CONNECT":
+            conn.sendall(build_error_response(405)[0])
+            status = 405
+            return
+
+        cache_path = get_cache_path(path)
+
+        if is_cache_hit(cache_path):
+            cache_status = "HIT"
+            response, status = load_from_cache(cache_path)
+        else:
+            cache_status = "MISS"
+            response, status = forward_to_server(path, parsed["headers"])
+
+            # Hanya simpan ke cache jika response dari server sukses
+            if status == 200:
+                save_to_cache(cache_path, response)
+
+        conn.sendall(response)
+
+    except Exception:
+        conn.sendall(build_error_response(500)[0])
+
+    finally:
+        elapsed = (time.time() - start) * 1000
+        log_request(addr, method, path, cache_status, status, elapsed)
+        conn.close()
+
+def read_request(conn):
     conn.settimeout(5)
+    data = b""
+
     try:
-        while b"\r\n\r\n" not in raw_data and len(raw_data) < MAX_REQUEST_SIZE:
+        while b"\r\n\r\n" not in data:
             chunk = conn.recv(BUFFER_SIZE)
             if not chunk:
                 break
-            raw_data += chunk
+            data += chunk
     except socket.timeout:
-        return raw_data
-    return raw_data
+        pass
 
+    return data
 
-def parse_http_request(raw_data):
-    if not raw_data:
+def parse_request(raw):
+    if not raw or b"\r\n\r\n" not in raw:
         return None
 
     try:
-        text = raw_data.decode("utf-8", errors="replace")
-        header_section = text.split("\r\n\r\n", 1)[0]
-        lines = header_section.split("\r\n")
-
-        parts = lines[0].split(" ", 2)
-        if len(parts) < 3:
-            return None
-
-        method, path, http_version = parts[0], parts[1], parts[2]
-
-        # FIX 1: Parse absolute URL dari browser
-        # Browser yg dikonfigurasi pakai proxy mengirim full URL, contoh:
-        # GET http://192.168.1.10:8000/index.html HTTP/1.1
-        # Kita ekstrak path-nya saja agar forwarding tetap benar
-        if path.startswith("http"):
-            path = urlparse(path).path or "/"
-
-        headers = {}
-        for line in lines[1:]:
-            if ":" in line:
-                key, _, value = line.partition(":")
-                headers[key.strip().lower()] = value.strip()
-
-        return {
-            "method":       method,
-            "path":         path,
-            "http_version": http_version,
-            "headers":      headers,
-        }
-    except Exception:
+        header_section = raw.split(b"\r\n\r\n", 1)[0].decode("ascii")
+    except UnicodeDecodeError:
         return None
 
+    lines = header_section.split("\r\n")
+    parts = lines[0].split()
 
-def extract_status_code(response_bytes):
-    try:
-        status_line = response_bytes.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
-        parts = status_line.split(" ", 2)
-        return int(parts[1])
-    except Exception:
-        return 500
+    if len(parts) != 3:
+        return None
 
+    method, path, version = parts
+
+    # Browser yang dikonfigurasi via proxy mengirim absolute URL
+    # contoh: GET http://192.168.1.10:8000/index.html HTTP/1.1
+    # kita ekstrak path-nya saja
+    if path.startswith("http"):
+        path = urlparse(path).path or "/"
+
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            key, _, value = line.partition(":")
+            headers[key.strip().lower()] = value.strip()
+
+    return {"method": method, "path": path, "version": version, "headers": headers}
 
 def get_cache_path(request_path):
+    # Ubah URL path menjadi nama file yang aman di filesystem
     if request_path == "/":
         filename = "index.html"
     else:
         filename = request_path.lstrip("/").replace("/", "_")
-
     return os.path.join(CACHE_DIR, filename)
-
 
 def is_cache_hit(cache_path):
     return os.path.isfile(cache_path)
 
-
 def load_from_cache(cache_path):
     with open(cache_path, "rb") as f:
-        return f.read()
+        data = f.read()
+    # Ekstrak status code dari response yang tersimpan
+    status_line = data.split(b"\r\n", 1)[0].decode("ascii")
+    status = int(status_line.split()[1])
+    return data, status
 
-
-def save_to_cache(cache_path, response_bytes, cache_lock):
-    with cache_lock:
+def save_to_cache(cache_path, response_bytes):
+    # Tulis ke file sementara dulu, baru rename — atomic write
+    # supaya thread lain tidak membaca file yang setengah ditulis
+    with CACHE_LOCK:
         tmp_path = cache_path + ".tmp"
         try:
             with open(tmp_path, "wb") as f:
                 f.write(response_bytes)
             os.replace(tmp_path, cache_path)
         except OSError as e:
-            print(f"[PROXY] Gagal menyimpan cache {cache_path}: {e}")
+            print(f"[PROXY] Cache write failed: {e}")
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
 
-
-def build_http_response(status_code, body_bytes, mime_type="text/html; charset=utf-8"):
-    status_message = STATUS_MESSAGES.get(status_code, "Unknown")
-    headers = (
-        f"HTTP/1.1 {status_code} {status_message}\r\n"
-        f"Content-Type: {mime_type}\r\n"
-        f"Content-Length: {len(body_bytes)}\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-    )
-    return headers.encode("utf-8") + body_bytes
-
-
-def build_error_response(status_code):
-    error_path = os.path.join(BASE_DIR, "status", f"{status_code}.html")
-    try:
-        with open(error_path, "rb") as f:
-            body_bytes = f.read()
-    except OSError:
-        status_message = STATUS_MESSAGES.get(status_code, "Error")
-        body_text = (
-            f"<!doctype html><html>"
-            f"<head><title>{status_code} {status_message}</title></head>"
-            f"<body><h1>{status_code} {status_message}</h1></body>"
-            f"</html>"
-        )
-        body_bytes = body_text.encode("utf-8")
-
-    return build_http_response(status_code, body_bytes, "text/html; charset=utf-8")
-
-
-def send_response(conn, response_bytes):
-    try:
-        conn.sendall(response_bytes)
-    except OSError:
-        pass 
-
-
-def forward_to_server(request_path, original_headers):
-    sock = None
+def forward_to_server(path, headers):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(REQUEST_TIMEOUT)
+        sock.settimeout(10)
         sock.connect((SERVER_HOST, SERVER_PORT))
 
-        request_line = f"GET {request_path} HTTP/1.1\r\n"
+        # Bangun request HTTP yang akan dikirim ke web server
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {SERVER_HOST}:{SERVER_PORT}\r\n"
+            f"Connection: close\r\n"
+        )
+        # Teruskan header relevan dari browser ke server
+        for key in ("user-agent", "accept", "accept-language"):
+            if key in headers:
+                request += f"{key}: {headers[key]}\r\n"
+        request += "\r\n"
 
-        # FIX 2: Forward header relevan dari browser ke server
-        # Sebelumnya hanya Host & Connection yg dikirim, browser butuh
-        # header seperti User-Agent & Accept agar server merespons dengan benar
-        forward_headers = f"Host: {SERVER_HOST}:{SERVER_PORT}\r\nConnection: close\r\n"
-        for key in ["user-agent", "accept", "accept-language"]:
-            if key in original_headers:
-                forward_headers += f"{key}: {original_headers[key]}\r\n"
-
-        sock.sendall((request_line + forward_headers + "\r\n").encode("ascii", errors="replace"))
+        sock.sendall(request.encode("ascii"))
 
         response = b""
         while True:
@@ -209,126 +207,52 @@ def forward_to_server(request_path, original_headers):
                 break
             response += chunk
 
-        return response if response else None
+        if not response:
+            return build_error_response(502)
 
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return None
+        status_line = response.split(b"\r\n", 1)[0].decode("ascii")
+        status = int(status_line.split()[1])
+        return response, status
+
+    except socket.timeout:
+        return build_error_response(504)
+    except (ConnectionRefusedError, OSError):
+        return build_error_response(502)
     finally:
-        close_socket(sock)
+        sock.close()
 
+def build_error_response(status_code):
+    status_text = {
+        400: "Bad Request",
+        405: "Method Not Allowed",
+        500: "Internal Server Error",
+        502: "Bad Gateway",
+        504: "Gateway Timeout",
+    }
 
-def handle_client(conn, addr, cache_lock):
-    start_time = time.time()
-
-    method       = "GET"
-    path         = "/"
-    http_version = "HTTP/1.1"
-    cache_status = "MISS"
-    status_code  = 400
-
+    error_file = os.path.join(BASE_DIR, "status", f"{status_code}.html")
     try:
-        raw_data = read_http_request(conn)
+        with open(error_file, "rb") as f:
+            body = f.read()
+    except OSError:
+        text = f"<h1>{status_code} {status_text.get(status_code, 'Error')}</h1>"
+        body = text.encode("utf-8")
 
-        parsed = parse_http_request(raw_data)
-        if parsed is None:
-            response = build_error_response(400)
-            send_response(conn, response)
-            elapsed_ms = (time.time() - start_time) * 1000
-            log_request(addr, method, path, http_version, cache_status, elapsed_ms, 400)
-            return
+    header = (
+        f"HTTP/1.1 {status_code} {status_text.get(status_code, 'Error')}\r\n"
+        f"Content-Type: text/html; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    )
+    return header.encode("ascii") + body, status_code
 
-        method       = parsed["method"]
-        path         = parsed["path"]
-        http_version = parsed["http_version"]
-        headers      = parsed["headers"]
+def log_request(addr, method, path, cache_status, status, elapsed_ms):
+    label = "HIT " if cache_status == "HIT" else "MISS"
+    print(f'[{now()}] [{label}] [{status}] {addr[0]} "{method} {path}" {elapsed_ms:.1f}ms')
 
-        # FIX 3: Tolak CONNECT (HTTPS) dengan jelas — 405 Method Not Allowed
-        # Proxy ini hanya mendukung HTTP, bukan HTTPS tunneling
-        if method == "CONNECT":
-            status_code = 405
-            response    = build_error_response(405)
-            send_response(conn, response)
-            elapsed_ms = (time.time() - start_time) * 1000
-            log_request(addr, method, path, http_version, cache_status, elapsed_ms, status_code)
-            return
-
-        cache_path = get_cache_path(path)
-
-        if is_cache_hit(cache_path):
-            cache_status = "HIT"
-            response     = load_from_cache(cache_path)
-            status_code  = extract_status_code(response)
-            send_response(conn, response)
-        else:
-            cache_status = "MISS"
-            response = forward_to_server(path, headers)
-
-            if response is None:
-                status_code = 504
-                response    = build_error_response(504)
-            else:
-                status_code = extract_status_code(response)
-                if status_code >= 500:
-                    status_code = 502
-                    response    = build_error_response(502)
-                elif status_code == 200:
-                    save_to_cache(cache_path, response, cache_lock)
-
-            send_response(conn, response)
-
-    except Exception as e:
-        print(f"[PROXY] Error menangani client {addr}: {e}")
-    finally:
-        elapsed_ms = (time.time() - start_time) * 1000
-        log_request(addr, method, path, http_version, cache_status, elapsed_ms, status_code)
-        close_socket(conn)
-
-
-def start_proxy_server():
-    proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    proxy_sock.bind((PROXY_HOST, PROXY_PORT))
-    proxy_sock.listen(50)
-    print(f"[PROXY] Proxy listening on {PROXY_HOST}:{PROXY_PORT}")
-    print(f"[PROXY] Forwarding MISS requests to {SERVER_HOST}:{SERVER_PORT}")
-    print(f"[PROXY] Cache directory: {CACHE_DIR}")
-    return proxy_sock
-
-
-def proxy_accept_loop(proxy_sock, cache_lock):
-    while True:
-        try:
-            conn, addr = proxy_sock.accept()
-        except OSError:
-            break
-
-        worker_name = f"proxy-worker-{addr[0]}:{addr[1]}"
-        worker = threading.Thread(
-            target=handle_client,
-            args=(conn, addr, cache_lock),
-            name=worker_name,
-            daemon=True,
-        )
-        worker.start()
-
-
-def main():
-    proxy_sock = None
-    cache_lock = threading.Lock()
-
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-    try:
-        proxy_sock = start_proxy_server()
-        proxy_accept_loop(proxy_sock, cache_lock)
-    except KeyboardInterrupt:
-        print("\n[PROXY] Shutting down gracefully...")
-    except OSError as error:
-        print(f"[PROXY] Startup error: {error}")
-    finally:
-        close_socket(proxy_sock)
-        print("[PROXY] Socket closed. Goodbye.")
-
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 if __name__ == "__main__":
     main()

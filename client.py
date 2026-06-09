@@ -2,133 +2,145 @@ import socket
 import sys
 import time
 
-PROXY_IP = "[IP_ADDRESS_PROXY]"
-PROXY_PORT = 8080
+PROXY_HOST      = "127.0.0.1"  # ganti dengan IP laptop proxy saat demo
+PROXY_PORT      = 8080
 
-WEBSERVER_IP = "0.0.0.0"     
-WEBSERVER_PORT = 9000
+WEBSERVER_HOST  = "127.0.0.1"  # ganti dengan IP laptop web server saat demo
+WEBSERVER_PORT  = 9000
 
-def run_tcp_client(resource_path):
-    if not resource_path.startswith('/'):
-        resource_path = '/' + resource_path
+BUFFER_SIZE     = 4096
+UDP_PACKET_COUNT = 10
+UDP_INTERVAL     = 0.2         # detik antar paket
 
-    print(f"Mengakses '{resource_path}' via Proxy ({PROXY_IP}:{PROXY_PORT})")
-    
-    tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp_socket.settimeout(5.0)
+
+def main():
+    if len(sys.argv) < 3 or sys.argv[1] != "-mode":
+        print("Penggunaan:")
+        print("  python client.py -mode tcp /index.html")
+        print("  python client.py -mode tcp /css/style.css")
+        print("  python client.py -mode udp")
+        sys.exit(1)
+
+    mode = sys.argv[2].lower()
+
+    if mode == "tcp":
+        path = sys.argv[3] if len(sys.argv) > 3 else "/index.html"
+        run_tcp(path)
+    elif mode == "udp":
+        run_udp()
+    else:
+        print("Error: mode harus 'tcp' atau 'udp'.")
+        sys.exit(1)
+
+
+def run_tcp(path):
+    if not path.startswith("/"):
+        path = "/" + path
+
+    print(f"[TCP] Mengakses '{path}' via proxy {PROXY_HOST}:{PROXY_PORT}")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+
     try:
-        tcp_socket.connect((PROXY_IP, PROXY_PORT))
-        
-        http_request = (
-            f"GET {resource_path} HTTP/1.1\r\n"
-            f"Host: {PROXY_IP}:{PROXY_PORT}\r\n"
-            f"Accept: text/html,application/xhtml+xml,text/css;q=0.9\r\n"
-            f"Connection: close\r\n\r\n"
+        sock.connect((PROXY_HOST, PROXY_PORT))
+
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {PROXY_HOST}:{PROXY_PORT}\r\n"
+            f"Accept: text/html,text/css\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
         )
-        tcp_socket.sendall(http_request.encode('utf-8'))
-        
-        response_bytes = b""
+        sock.sendall(request.encode("ascii"))
+
+        response = b""
         while True:
-            chunk = tcp_socket.recv(4096)
+            chunk = sock.recv(BUFFER_SIZE)
             if not chunk:
                 break
-            response_bytes += chunk
-            
-        try:
-            header_part, body_part = response_bytes.split(b"\r\n\r\n", 1)
-            
-            print(f"\n[RAW HTTP RESPONSE HEADER]\n{header_part.decode('utf-8')}\n" + "="*60)
-            
-            if resource_path.endswith(('.html', '.css', '.js', '/')) or '.' not in resource_path.split('/')[-1]:
-                print(f"\n[RESPONSE BODY (TEXT/HTML/CSS)]\n{body_part.decode('utf-8', errors='ignore')}")
-            else:
-                print(f"\n[RESPONSE BODY (BINARY DATA)]: Berhasil menerima {len(body_part)} bytes.")
-            print("="*60 + "\n")
-            
-        except ValueError:
-            print(f"\n[RAW RESPONSE (Malformed HTTP)]\n{response_bytes.decode('utf-8', errors='ignore')}")
-            
-    except socket.timeout:
-        print("Error: koneksi ke server proxy gagal (504)")
-    except ConnectionRefusedError:
-        print("Error: Server proxy tidak berjalan.")
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        tcp_socket.close()
+            response += chunk
 
-def run_udp_pinger():
-    print(f"UDP mengirim paket QoS ke Web Server ({WEBSERVER_IP}:{WEBSERVER_PORT})")
-    
-    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_socket.settimeout(1.0)
-    
+        # Pisahkan header dan body untuk ditampilkan
+        if b"\r\n\r\n" in response:
+            headers, body = response.split(b"\r\n\r\n", 1)
+            print(f"\n[HEADER]\n{headers.decode('ascii')}")
+            print("=" * 60)
+
+            # Body teks ditampilkan langsung, binary cukup ukurannya
+            if path.endswith((".html", ".css", ".js", "/")):
+                print(f"[BODY]\n{body.decode('utf-8', errors='ignore')}")
+            else:
+                print(f"[BODY] Binary — {len(body)} bytes diterima")
+        else:
+            print(f"[RESPONSE] {response.decode('utf-8', errors='ignore')}")
+
+    except socket.timeout:
+        print("Error: koneksi timeout — proxy tidak merespons (504)")
+    except ConnectionRefusedError:
+        print("Error: proxy tidak berjalan")
+    finally:
+        sock.close()
+
+def run_udp():
+    print(f"[UDP] QoS test ke {WEBSERVER_HOST}:{WEBSERVER_PORT} — {UDP_PACKET_COUNT} paket")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(1.0)
+
+    rtt_list = []
+    sent = 0
+
     try:
-        rtt_list = []
-        total_sent = 10
-        total_payload_size = 0
-        start_test_time = time.time()
-        
-        for seq in range(1, total_sent + 1):
+        for seq in range(1, UDP_PACKET_COUNT + 1):
+            payload = f"ping seq={seq} time={time.time()}"
             send_time = time.time()
-            payload = f"Ping {seq} {send_time}"
-            
+            sent += 1
+
             try:
-                udp_socket.sendto(payload.encode('utf-8'), (WEBSERVER_IP, WEBSERVER_PORT))
-                data, _ = udp_socket.recvfrom(1024)
+                sock.sendto(payload.encode("utf-8"), (WEBSERVER_HOST, WEBSERVER_PORT))
+                data, _ = sock.recvfrom(BUFFER_SIZE)
                 rtt = (time.time() - send_time) * 1000
                 rtt_list.append(rtt)
-                total_payload_size += len(data)
-                
-                print(f"Reply from {WEBSERVER_IP}: bytes={len(data)} seq={seq} RTT={rtt:.2f} ms")
+                print(f"  Reply seq={seq} bytes={len(data)} RTT={rtt:.2f}ms")
             except socket.timeout:
-                print(f"Request seq={seq} timed out.")
-            except Exception as e:
-                print(f"Error pada paket ke-{seq}: {e}")
-                
-            time.sleep(0.2)
-            
-        total_duration = time.time() - start_test_time
+                print(f"  Timeout seq={seq}")
+
+            time.sleep(UDP_INTERVAL)
+
     finally:
-        udp_socket.close()
-        
-    print("Uji QoS")
-    packets_received = len(rtt_list)
-    if packets_received == 0:
-        print("Packet Loss: 100%")
+        sock.close()
+
+    print_stats(sent, rtt_list)
+
+def print_stats(sent, rtt_list):
+    received = len(rtt_list)
+    lost = sent - received
+    loss_pct = (lost / sent) * 100 if sent > 0 else 0
+
+    print("\n--- Statistik QoS ---")
+    print(f"Paket  : {sent} terkirim, {received} diterima, {lost} hilang")
+    print(f"Loss   : {loss_pct:.1f}%")
+
+    if received == 0:
+        print("Tidak ada data RTT.")
         return
 
-    packet_loss_pct = ((total_sent - packets_received) / total_sent) * 100
-    differences = [j - i for i, j in zip(rtt_list, rtt_list[1:])]
-    if differences:
-        avg_diff = sum(differences) / len(differences)
-        jitter = (sum((d - avg_diff) ** 2 for d in differences) / len(differences)) ** 0.5
+    min_rtt = min(rtt_list)
+    avg_rtt = sum(rtt_list) / received
+    max_rtt = max(rtt_list)
+
+    # Jitter = rata-rata selisih absolut antar RTT berurutan (RFC 3550)
+    if received > 1:
+        jitter = sum(
+            abs(rtt_list[i+1] - rtt_list[i]) for i in range(received - 1)
+        ) / (received - 1)
     else:
         jitter = 0.0
-    throughput_kbps = (total_payload_size * 8 / 1000) / total_duration if total_duration > 0 else 0
-    
-    print(f"Paket terkirim = {total_sent}, Diterima = {packets_received}, Hilang = {total_sent - packets_received}")
-    print(f"Packet Loss   : {packet_loss_pct:.1f} %")
-    print(f"RTT           : {min(rtt_list):.2f} ms / {sum(rtt_list)/packets_received:.2f} ms / {max(rtt_list):.2f} ms")
-    print(f"Jitter        : {jitter:.2f} ms")
-    print(f"Throughput    : {throughput_kbps:.2f} kbps\n")
+
+    print(f"RTT    : min={min_rtt:.2f}ms  avg={avg_rtt:.2f}ms  max={max_rtt:.2f}ms")
+    print(f"Jitter : {jitter:.2f}ms")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3 or sys.argv[1] != "-mode":
-        print("Cara akses client IFLAB")
-        print("  Akses Halaman Utama : python client.py -mode tcp /index.html")
-        print("  Akses Materi OSI    : python client.py -mode tcp /osi.html")
-        print("  Akses File CSS      : python client.py -mode tcp /css/style.css")
-        print("  Uji Parameter QoS   : python client.py -mode udp")
-        sys.exit(1)
-        
-    mode = sys.argv[2].lower()
-    
-    if mode == "tcp":
-        resource = sys.argv[3] if len(sys.argv) > 3 else "/index.html"
-        run_tcp_client(resource)
-    elif mode == "udp":
-        run_udp_pinger()
-    else:
-        print("Error. Pilih 'tcp' atau 'udp'.")
-        sys.exit(1)
+    main()
+
